@@ -54,6 +54,11 @@ class RecordingService : Service() {
     private var captureSession: android.hardware.camera2.CameraCaptureSession? = null
     private var currentOutputFile: File? = null
 
+    // 由摄像头能力决定的录制参数
+    private var videoSize: Size = Size(1280, 720)
+    private var videoBitrate: Int = 4_000_000
+    private var sensorOrientation: Int = 90
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -139,6 +144,14 @@ class RecordingService : Service() {
             return
         }
 
+        // 根据摄像头能力选择录制尺寸（优先 3840×2160）与方向
+        val chars = manager.getCameraCharacteristics(cameraId)
+        chars.get(CameraCharacteristics.SENSOR_ORIENTATION)?.let { sensorOrientation = it }
+        pickVideoSize(chars)?.let { (size, bitrate) ->
+            videoSize = size
+            videoBitrate = bitrate
+        }
+
         try {
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
@@ -183,6 +196,36 @@ class RecordingService : Service() {
             }
         }
         return manager.cameraIdList.firstOrNull()
+    }
+
+    /**
+     * 从摄像头支持的输出尺寸中选择录制分辨率：优先 3840×2160，其次 1920×1080，
+     * 再次 1280×720；都没有则取最大可用尺寸。码率随分辨率调整。
+     * 返回 (尺寸, 码率)。
+     */
+    private fun pickVideoSize(chars: CameraCharacteristics): Pair<Size, Int>? {
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+        val outputs = map.getOutputSizes(MediaRecorder::class.java)
+        if (outputs.isNullOrEmpty()) return null
+
+        val candidates = listOf(
+            Size(3840, 2160) to 16_000_000,
+            Size(1920, 1080) to 8_000_000,
+            Size(1280, 720) to 4_000_000
+        )
+        for ((size, bitrate) in candidates) {
+            if (outputs.any { it.width == size.width && it.height == size.height }) {
+                return size to bitrate
+            }
+        }
+        // 取面积最大的支持尺寸作为兜底
+        val largest = outputs.maxByOrNull { it.width.toLong() * it.height } ?: return null
+        val bitrate = when {
+            largest.width >= 3840 -> 16_000_000
+            largest.width >= 1920 -> 8_000_000
+            else -> 4_000_000
+        }
+        return largest to bitrate
     }
 
     private fun startCaptureSession() {
@@ -252,10 +295,10 @@ class RecordingService : Service() {
             setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            setVideoEncodingBitRate(4_000_000)
+            setVideoEncodingBitRate(videoBitrate)
             setVideoFrameRate(30)
-            setVideoSize(1280, 720)
-            setOrientationHint(90) // 后置摄像头竖屏录制
+            setVideoSize(videoSize.width, videoSize.height)
+            setOrientationHint(sensorOrientation) // 按传感器方向修正
             setOutputFile(outFile.absolutePath)
             try {
                 prepare()

@@ -6,27 +6,49 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 
 /**
- * 主界面：仅一个按钮。
- * 首次点击 -> 申请权限 -> 文字变更为「停止录制」并启动前台服务开始录制。
- * 再次点击 -> 文字恢复「开始录制」并结束录制。
- * 全程不显示任何相机预览画面。
+ * 伪装主界面：词组背诵 app「词组通」。
+ *
+ * - RecyclerView 展示词组，中文释义默认隐藏。
+ * - 「显示中文释义」按钮：点击 = 显示中文 + 开始录制；再点 = 隐藏中文 + 结束录制。
+ *   （原录制按钮的 start/stop 语义保留，仅在文字上伪装为词组释义开关。）
+ * - 右下角 FAB：自定义添加词组。
+ * - 三击顶部标题「词组通」：进入隐藏的视频列表页。
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), AddPhraseDialogFragment.OnAddListener {
 
+    private lateinit var appTitle: TextView
+    private lateinit var rvPhrases: RecyclerView
+    private lateinit var tvEmpty: TextView
     private lateinit var btnRecord: Button
+
+    private lateinit var store: PhraseStore
+    private lateinit var adapter: PhraseAdapter
+
     private var recording = false
+
+    // 三击标题计数
+    private var titleClickCount = 0
+    private var lastTitleClickTime = 0L
 
     private val requiredPermissions: Array<String>
         get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+            arrayOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.POST_NOTIFICATIONS
+            )
         } else {
             arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
         }
@@ -36,16 +58,17 @@ class MainActivity : AppCompatActivity() {
             val camera = result[Manifest.permission.CAMERA] == true
             val audio = result[Manifest.permission.RECORD_AUDIO] == true
             if (camera && audio) {
-                startRecording()
+                toggleRecord()
             } else {
-                Toast.makeText(this, "需要相机和录音权限才能录制视频", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "需要相机和录音权限", Toast.LENGTH_LONG).show()
                 if (!shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) ||
                     !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)
                 ) {
-                    // 用户勾选了「不再询问」，引导到系统设置
-                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                        data = Uri.fromParts("package", packageName, null)
-                    })
+                    startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", packageName, null)
+                        }
+                    )
                 }
             }
         }
@@ -54,59 +77,95 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        appTitle = findViewById(R.id.appTitle)
+        rvPhrases = findViewById(R.id.rvPhrases)
+        tvEmpty = findViewById(R.id.tvEmpty)
         btnRecord = findViewById(R.id.btnRecord)
-        btnRecord.setOnClickListener {
-            if (recording) {
-                stopRecording()
-            } else {
-                tryStart()
+        findViewById<android.view.View>(R.id.fabAdd).setOnClickListener {
+            AddPhraseDialogFragment().show(supportFragmentManager, "add_phrase")
+        }
+
+        store = PhraseStore(this)
+        adapter = PhraseAdapter(store.load(), showZh = false)
+        rvPhrases.layoutManager = LinearLayoutManager(this)
+        rvPhrases.adapter = adapter
+        refreshEmptyState()
+
+        // 三击标题进入隐藏视频列表
+        appTitle.setOnClickListener {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastTitleClickTime > 1500) titleClickCount = 0
+            titleClickCount++
+            lastTitleClickTime = now
+            if (titleClickCount >= 3) {
+                titleClickCount = 0
+                startActivity(Intent(this, VideoListActivity::class.java))
             }
         }
-    }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        // 点击通知返回时刷新按钮状态（前台服务可能已自行停止）
-        if (intent.getBooleanExtra(RecordingService.EXTRA_REFRESH_UI, false)) {
-            updateUi(isRecording = false)
+        btnRecord.setOnClickListener {
+            // 未录制 -> 检查权限后开始；录制中 -> 结束
+            if (recording) {
+                toggleRecord()
+            } else {
+                ensurePermissionsThenToggle()
+            }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // 回到前台时与服务的实际状态对齐
-        updateUi(isRecording = RecordingService.isRunning)
+        // 与服务的真实录制状态对齐（服务可能已自行停止）
+        if (recording && !RecordingService.isRunning) {
+            applyUiState(isRecording = false)
+        }
     }
 
-    private fun tryStart() {
+    private fun ensurePermissionsThenToggle() {
         val missing = requiredPermissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
         if (missing.isEmpty()) {
-            startRecording()
+            toggleRecord()
         } else {
             permissionLauncher.launch(missing.toTypedArray())
         }
     }
 
-    private fun startRecording() {
+    /**
+     * 切换录制状态，同时切换中文释义显示：
+     *  idle -> 显示中文 + 开始录制
+     *  recording -> 隐藏中文 + 结束录制
+     */
+    private fun toggleRecord() {
+        val nowRecording = !recording
+        applyUiState(isRecording = nowRecording)
         val intent = Intent(this, RecordingService::class.java).apply {
-            action = RecordingService.ACTION_START
+            action = if (nowRecording) RecordingService.ACTION_START else RecordingService.ACTION_STOP
         }
-        ContextCompat.startForegroundService(this, intent)
-        updateUi(isRecording = true)
+        if (nowRecording) {
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            startService(intent)
+        }
     }
 
-    private fun stopRecording() {
-        val intent = Intent(this, RecordingService::class.java).apply {
-            action = RecordingService.ACTION_STOP
-        }
-        startService(intent)
-        updateUi(isRecording = false)
-    }
-
-    private fun updateUi(isRecording: Boolean) {
+    private fun applyUiState(isRecording: Boolean) {
         recording = isRecording
-        btnRecord.text = getString(if (isRecording) R.string.btn_stop else R.string.btn_start)
+        adapter.setShowZh(isRecording)
+        btnRecord.text = getString(
+            if (isRecording) R.string.btn_hide_zh else R.string.btn_show_zh
+        )
+    }
+
+    private fun refreshEmptyState() {
+        tvEmpty.visibility = if (adapter.itemCount == 0) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    // 添加词组回调
+    override fun onPhraseAdded(phrase: Phrase) {
+        store.add(phrase)
+        adapter.submit(store.load())
+        refreshEmptyState()
     }
 }
